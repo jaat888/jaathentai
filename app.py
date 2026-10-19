@@ -939,6 +939,35 @@ CONVERT_SERVICE = os.environ.get("CONVERT_SERVICE", "https://wsrv.nl/").strip()
 _WS = {"fail": 0, "off": 0.0}
 
 
+PDF_Q = int(os.environ.get("PDF_Q", "95"))   # JPEG quality when webp/png must be converted
+PDF_WIDTH = int(os.environ.get("PDF_WIDTH", "0"))   # pictures wider than this are shrunk (0 = keep original size)
+
+
+def prep_image(data, ctype):
+    """Make one picture PDF-ready: shrink very wide pictures and turn webp/png into JPEG. Returns (bytes, ext).
+    Small JPEGs are passed through untouched (no decoding, no RAM)."""
+    ext = EXT.get(ctype, "jpg")
+    if Image is None:
+        return data, ext
+    try:
+        with Image.open(BytesIO(data)) as im:
+            w, h = im.size
+            big = PDF_WIDTH and w > PDF_WIDTH * 1.15
+            if ctype == "image/jpeg" and im.mode in ("RGB", "L") and not big:
+                return data, "jpg"
+            with CONV_LOCK:  # one decoded picture in RAM at a time
+                if big and im.format == "JPEG":
+                    im.draft("RGB", (PDF_WIDTH, max(1, int(h * PDF_WIDTH / w))))  # JPEG decodes at 1/2, 1/4... size: fast, low RAM
+                im = im.convert("RGB")
+                if big:
+                    im = im.resize((PDF_WIDTH, max(1, round(h * PDF_WIDTH / w))), Image.LANCZOS, reducing_gap=2.0)
+                buf = BytesIO()
+                im.save(buf, "JPEG", quality=PDF_Q)
+                return buf.getvalue(), "jpg"
+    except Exception:
+        return data, ext  # keep the original, build_pdf can still handle it
+
+
 def fetch_via_service(url):
     """Returns (jpeg_bytes, 'image/jpeg') from the free converter, or None (caller then does it locally)."""
     if not CONVERT_SERVICE or time.time() < _WS["off"]:
@@ -946,7 +975,7 @@ def fetch_via_service(url):
     if urlparse(url).path.lower().endswith((".jpg", ".jpeg")):  # already JPEG: no conversion needed, skip the extra hop
         return None
     try:
-        r = http.get(CONVERT_SERVICE, params={"url": url, "output": "jpg", "q": "85"}, timeout=40)
+        r = http.get(CONVERT_SERVICE, params={"url": url, "output": "jpg", "q": str(PDF_Q), **({"w": PDF_WIDTH, "we": 1} if PDF_WIDTH else {})}, timeout=40)
         ok = r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image/jpeg") and len(r.content) > 1500
     except requests.RequestException:
         ok = False
@@ -1302,19 +1331,7 @@ def fetch_chapter_images(job, tmp, ci, c):
             time.sleep(1.0 * (k + 1))
         if not res:
             raise RuntimeError(f"image {idx} failed")
-        data, ctype = res
-        ext = EXT.get(ctype, "jpg")
-        if ctype != "image/jpeg" and Image is not None:
-            # convert webp/png to JPEG right here, while other images are still downloading
-            # (Pillow releases the GIL, so this overlaps with the network instead of adding a slow build step later)
-            try:
-                with CONV_LOCK:  # one decoded image in RAM at a time (tall webtoon strips are big when decoded)
-                    with Image.open(BytesIO(data)) as im:
-                        buf = BytesIO()
-                        im.convert("RGB").save(buf, "JPEG", quality=85)
-                    data, ext = buf.getvalue(), "jpg"
-            except Exception:
-                pass  # keep the original, build_pdf can still convert it
+        data, ext = prep_image(*res)
         path = os.path.join(tmp, f"{ci:03d}_{idx:04d}.{ext}")
         with open(path, "wb") as fh:
             fh.write(data)
