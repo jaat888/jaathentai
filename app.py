@@ -475,10 +475,11 @@ SQL_URL = SQL_BASE if SQL_BASE.endswith("/sql") else SQL_BASE + "/sql"
 CHUNK = max(32, int(os.environ.get("CHUNK_KB", "192"))) * 1024   # raw bytes per DB row
 PER_INSERT = 3                                                     # rows per INSERT request
 UP_PAR = max(1, min(int(os.environ.get("UP_PAR", "4")), 8))        # parallel INSERT requests
+FAST_STORE = os.environ.get("FAST_STORE", "1") != "0"                  # PDFs go straight to the storage file API (binary, resumable)
 DL_PAR = 4                                                         # parallel chunk reads while downloading a PDF
 IMG_PAR = max(1, min(int(os.environ.get("IMG_PAR", "6")), 10))     # parallel image downloads
 NUM_WORKERS = max(1, min(int(os.environ.get("JOB_WORKERS", "2")), 4))  # jobs running at the same time
-USER_MAX_CH = int(os.environ.get("USER_MAX_CH", "50"))             # chapters per request for normal users
+USER_MAX_CH = int(os.environ.get("USER_MAX_CH", "0"))              # chapters per request for normal users (0 = no limit)
 AUTO_MIN = max(10, int(os.environ.get("AUTO_MIN", "360")))            # auto-update check every N minutes
 USER_MAX_JOBS = 2                                                  # active jobs per normal user
 TZ_MIN = int(os.environ.get("TZ_MIN", "330"))                      # minutes added to UTC for display (330 = IST)
@@ -543,6 +544,10 @@ def init_schema():
             sql("select uid from files limit 1", retries=1)
         except RuntimeError:  # old table without owner column
             sql("alter table files add column uid integer")
+        try:
+            sql("select tg from files limit 1", retries=1)
+        except RuntimeError:  # old table without the storage-file column
+            sql("alter table files add column tg text")
         sql("create table if not exists chunks(file_id integer, n integer, data text, primary key(file_id, n))")
         sql("create table if not exists users(id integer primary key autoincrement, name text unique, pw text, created integer)")
         sql("create table if not exists hist(uid integer, slug text, title text, cover text, cid text, cname text, ts integer, primary key(uid, slug))")
@@ -613,7 +618,89 @@ def save_state(uid, st):
     _STC[uid] = (time.time(), raw)
 
 
+STORE_BASE = SQL_BASE[:-4] if SQL_BASE.endswith("/sql") else SQL_BASE   # .../p/KEY
+
+
+def tg_up(tid, path, name, cb=None):
+    """Send a PDF as raw binary to the storage /upload endpoint. Resumes from where it stopped if the link breaks."""
+    size = os.path.getsize(path)
+    fails = 0
+    while True:
+        try:
+            r = sqlhttp.get(f"{STORE_BASE}/status/{tid}", timeout=30)
+            st = r.json() if r.status_code == 200 else {}
+            if st.get("done"):
+                return tid
+            have = int(st.get("stored", 0)) if r.status_code == 200 else 0
+
+            def body():
+                sent = have
+                with open(path, "rb") as f:
+                    f.seek(have)
+                    while True:
+                        b = f.read(1 << 20)
+                        if not b:
+                            break
+                        sent += len(b)
+                        if cb:
+                            cb(min(0.99, sent / max(size, 1)))
+                        yield b
+
+            u = f"{STORE_BASE}/upload?" + urlencode({"id": tid, "name": name, "offset": have, "size": size})
+            r = requests.post(u, data=body(), headers={"Content-Length": str(size - have),
+                                                       "Content-Type": "application/octet-stream"}, timeout=(15, 900))
+            if r.status_code == 200 and r.json().get("done"):
+                return tid
+            if r.status_code in (400, 401, 403, 404, 413, 503):  # storage refuses (no bot enabled, too big...): not worth retrying
+                raise StorageRefused(f"HTTP {r.status_code} {r.text[:150]}")
+            raise RuntimeError(f"HTTP {r.status_code} {r.text[:150]}")
+        except StorageRefused:
+            raise
+        except Exception as ex:
+            fails += 1
+            app.logger.warning("fast upload try %d failed: %s", fails, str(ex)[:150])
+            if fails >= 8:
+                raise
+            time.sleep(min(2 * fails, 15))
+
+
+class StorageRefused(Exception):
+    pass
+
+
+def tg_rm(tid):
+    if not tid:
+        return
+    try:
+        sqlhttp.delete(f"{STORE_BASE}/file/{tid}", timeout=60)
+    except Exception:
+        app.logger.warning("could not delete stored file %s", tid, exc_info=True)
+
+
 def store_pdf(path, name, slug, uid, cb=None):
+    """Store a PDF: fast binary upload to the storage file API; on any trouble fall back to the old SQL way."""
+    if FAST_STORE:
+        init_schema()
+        size = os.path.getsize(path)
+        j = sql("insert into files(slug, name, size, parts, created, uid) values(?,?,?,0,datetime('now'),?)",
+                [slug, name, size, uid])
+        fid = j.get("last_id") or q("select max(id) as m from files")[0][0]["m"]
+        tid = f"pdf{fid}x{int(time.time())}"
+        try:
+            tid = tg_up(tid, path, name, cb)
+            sql("update files set tg=?, parts=1 where id=?", [tid, fid])  # parts>0 = finished; only then it shows in Library
+            return fid
+        except Exception as ex:
+            app.logger.warning("fast store failed (%s), using SQL storage", str(ex)[:150])
+            tg_rm(tid)
+            try:
+                sql("delete from files where id=?", [fid])
+            except Exception:
+                pass
+    return store_pdf_sql(path, name, slug, uid, cb)
+
+
+def store_pdf_sql(path, name, slug, uid, cb=None):
     """Upload a PDF to SQL storage in base64 chunks (several INSERTs in parallel). Returns the file id."""
     init_schema()
     size = os.path.getsize(path)
@@ -662,6 +749,9 @@ def store_pdf(path, name, slug, uid, cb=None):
 
 
 def delete_file(fid, owner):
+    rows, _ = q("select tg from files where id=?", [fid])
+    if rows and rows[0].get("tg"):
+        tg_rm(rows[0]["tg"])
     sql("delete from chunks where file_id=?", [fid])
     sql("delete from files where id=?", [fid])
     with LOCK:
@@ -959,7 +1049,7 @@ def enqueue(me, slug, spec, per):
         base = select(spec, chs, done)
     sel = [c for c in base if c["chapter_id"] not in pending]
     note = ""
-    if not me["admin"] and len(sel) > USER_MAX_CH:
+    if USER_MAX_CH and not me["admin"] and len(sel) > USER_MAX_CH:
         sel, note = sel[:USER_MAX_CH], f"Limit: only the first {USER_MAX_CH} chapters were queued"
     if not sel:
         return None
@@ -1319,6 +1409,7 @@ const th=$('#thm');if(th)th.onclick=()=>{const d=document.documentElement,t=d.da
 function setBadge(n){const b=$('#qb');if(b){b.textContent=n||'';b.hidden=!n}}
 async function pollBadge(){if(document.hidden||window.NOBADGE)return;try{const j=await api('/api/jobs?brief=1');setBadge(j.active)}catch(e){}}
 setInterval(pollBadge,6000);pollBadge();
+function perPref(){let v=0;try{v=parseInt(localStorage.getItem('per'))||0}catch(e){}return v>=1&&v<=30?v:0}
 function dlAdd(slug,spec,per,btn){busy(btn,1);
   return api('/api/dl',{slug:slug,spec:spec,per:per}).then(j=>{toast(j.msg||'Done');if(j.ok)pollBadge();return j}).catch(()=>toast('Network problem')).finally(()=>busy(btn,0))}
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
@@ -1829,8 +1920,9 @@ MANGA = T(MACROS + """<div id=mp data-slug="{{slug}}"></div>
 <div id=stw {{'hidden' if not saved}} class=bar><select id=st onchange="setSt(this.value)">
 {% for v,l in [('reading','Reading'),('completed','Completed'),('plan','Plan to read')] %}<option value="{{v}}" {{'selected' if v==status_}}>{{l}}</option>{% endfor %}</select></div>
 <details class=card><summary><b>⬇ Download as PDF</b></summary>
-<div class=bar style="flex-wrap:wrap"><input id=sp value="new" placeholder="new · all · 1-50 · latest 10"><select id=per><option value=1>1 chapter = 1 PDF</option><option value=3>3 chapters = 1 PDF</option><option value=5>5 chapters = 1 PDF</option><option value=10>10 chapters = 1 PDF</option><option value=20>20 chapters = 1 PDF</option></select></div>
+<div class=bar style="flex-wrap:wrap"><input id=sp value="new" placeholder="new · all · 1-50 · latest 10"><select id=per><option value=1>1 chapter = 1 PDF</option><option value=3>3 chapters = 1 PDF</option><option value=5>5 chapters = 1 PDF</option><option value=10>10 chapters = 1 PDF</option><option value=20>20 chapters = 1 PDF</option><option value=30>30 chapters = 1 PDF</option></select></div>
 <small>Examples: new · all · 1-50 · 1,5,10-20 · latest 10</small><div style="margin-top:8px"><button onclick="dlAdd(slug,$('#sp').value,$('#per').value,this)">Add to queue</button></div></details>
+<script>addEventListener('DOMContentLoaded',function(){const s=$('#per');if(!s)return;const v=perPref();if(v&&[...s.options].some(o=>+o.value===v))s.value=v;s.addEventListener('change',()=>{try{localStorage.setItem('per',s.value)}catch(e){}})})</script>
 <div class=bar><button class="sec sm" onclick="markAll(1)">Mark all read</button><button class="sec sm" onclick="markAll(0)">Mark all unread</button><span class=sp></span><small>{{rd|length}} / {{chs|length}} read</small></div>
 <div id=chl>{% for c in chs|reverse %}<div class="ch {{'isr' if c.chapter_id in rd}}" data-cid="{{c.chapter_id}}" data-spec="{{c.spec}}">
 <button class="ck {{'on' if c.chapter_id in rd}}" onclick="rk(this)">{{'✓' if c.chapter_id in rd}}</button>
@@ -2180,7 +2272,7 @@ def api_dl():
     if job is None:
         return jsonify({"ok": False, "msg": "Nothing new to download (already downloaded or in the queue)."})
     note = f" · {job['note']}" if job["note"] else ""
-    return jsonify({"ok": True, "msg": f"{len(job['chapters'])} chapters added to the queue{note}", "job": job["id"]})
+    return jsonify({"ok": True, "msg": f"{len(job['chapters'])} chapters added · {job['per']} per PDF{note}", "job": job["id"]})
 
 
 @app.post("/api/update")
@@ -2189,6 +2281,10 @@ def api_update():
     me = cur()
     d = request.get_json(silent=True) or {}
     st = load_state(me["uid"])
+    try:
+        want_per = int(d.get("per") or 0)
+    except (TypeError, ValueError):
+        want_per = 0
     slugs = [d["slug"]] if d.get("slug") else list(st)
     if not slugs:
         return jsonify({"ok": False, "msg": "Your library is empty."})
@@ -2198,7 +2294,7 @@ def api_update():
             if not me["admin"] and len(active_of(me["uid"])) >= USER_MAX_JOBS:
                 break
             try:
-                enqueue(me, slug, "new", st.get(slug, {}).get("per", 1))
+                enqueue(me, slug, "new", want_per or st.get(slug, {}).get("per", 1))
             except Exception:
                 app.logger.warning("update failed for %s", slug, exc_info=True)
 
@@ -2311,7 +2407,7 @@ bar.style.width='100%';pb.classList.add('ok');btn.textContent='✓ Saved';toast(
 setTimeout(()=>{pb.hidden=true;pb.classList.remove('ok');btn.disabled=false;btn.textContent='⬇ Download'},3500)}
 catch(e){toast('Download failed. Please try again.');pb.hidden=true;btn.disabled=false;btn.textContent='⬇ Download'}}
 async function del(id,b){if(!confirm('Delete this PDF?'))return;busy(b,1);const j=await api('/api/del/'+id,{});if(j.ok){const f=b.closest('.f'),g=b.closest('.grp');f.remove();if(!$('.f',g))g.remove();toast('Deleted')}else{busy(b,0);toast(j.msg)}}
-async function upd(slug,b){busy(b,1);const j=await api('/api/update',slug?{slug:slug}:{});toast(j.msg);busy(b,0);tick()}
+async function upd(slug,b){busy(b,1);const j=await api('/api/update',Object.assign(slug?{slug:slug}:{},{per:perPref()}));toast(j.msg);busy(b,0);tick()}
 async function auto(b){busy(b,1);const j=await api('/api/auto',{});b.textContent='Auto-update: '+(j.on?'ON':'OFF');busy(b,0);toast(j.on?'Auto-update ON':'Auto-update OFF')}
 let last=-1,tmr;
 async function tick(){clearTimeout(tmr);let n=0;
@@ -2357,10 +2453,27 @@ def ui_library():
 @app.get("/f/<int:fid>")
 def ui_file(fid):
     me = cur()
-    rows, _ = q("select name, size, parts, uid from files where id=? and parts>0", [fid])
+    rows, _ = q("select name, size, parts, uid, tg from files where id=? and parts>0", [fid])
     if not rows or not owns(me, rows[0]["uid"]):
         return reply(status=404, message="File not found, or it has not finished uploading yet.")
     f = rows[0]
+    if f.get("tg"):  # new way: stream straight from storage (keeps Range so a broken download can resume)
+        hdr = {"Range": request.headers["Range"]} if request.headers.get("Range") else {}
+        try:
+            up = sqlhttp.get(f"{STORE_BASE}/file/{f['tg']}", headers=hdr, stream=True, timeout=(15, 120))
+        except requests.RequestException:
+            return reply(status=502, message="Storage is not reachable right now. Try again in a moment.")
+        if up.status_code not in (200, 206):
+            up.close()
+            return reply(status=404 if up.status_code == 404 else 502, message="Storage could not give this file.")
+        resp = Response(up.iter_content(256 * 1024), status=up.status_code, mimetype="application/pdf")
+        resp.call_on_close(up.close)
+        for h in ("Content-Length", "Content-Range"):
+            if up.headers.get(h):
+                resp.headers[h] = up.headers[h]
+        resp.headers["Accept-Ranges"] = "bytes"
+        resp.headers["Content-Disposition"] = "attachment; filename*=UTF-8''" + quote(f["name"])
+        return resp
 
     def get_chunk(n):
         r, j = q("select data from chunks where file_id=? and n=?", [fid, n])
@@ -2558,6 +2671,8 @@ def ui_admin_out(uid):
 def ui_admin_del(uid):
     need_admin()
     if uid > 0:
+        for r in q("select tg from files where uid=? and tg is not null and tg != ''", [uid])[0]:
+            tg_rm(r["tg"])
         sql("delete from chunks where file_id in (select id from files where uid=?)", [uid])
         sql("delete from files where uid=?", [uid])
         sql("delete from hist where uid=?", [uid])
