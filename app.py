@@ -620,15 +620,20 @@ def save_state(uid, st):
 STORE_BASE = SQL_BASE[:-4] if SQL_BASE.endswith("/sql") else SQL_BASE   # .../p/KEY
 
 
+STORE_CHUNK = int(float(os.environ.get("STORE_CHUNK_MB", "18")) * 1048576)   # must be the same as CHUNK_MB of the storage
+UP_PIECE_CHUNKS = max(1, min(int(os.environ.get("UP_PIECE_CHUNKS", "2")), 4))    # storage chunks sent per request (its own dashboard sends 2-4)
+
+
 class _UploadBody:
     """File-like upload body with a known length. With it requests sends a plain Content-Length.
     (A generator body made requests send 'Transfer-Encoding: chunked' AS WELL as Content-Length; a proxy in front
     of the storage then reads the raw bytes as chunks and the upload breaks.)"""
 
-    def __init__(self, path, offset, size, cb=None):
+    def __init__(self, path, offset, size, cb=None, end=None):
         self.f = open(path, "rb")
         self.f.seek(offset)
-        self.start, self.total, self.size, self.cb = offset, size - offset, size, cb
+        self.start, self.size, self.cb = offset, size, cb
+        self.total = (size if end is None else end) - offset
         self.sent, self._mark = offset, offset
 
     def __len__(self):
@@ -658,10 +663,21 @@ class StorageRefused(Exception):
     pass
 
 
+def _short(r):
+    """Response text for an error message; an html error page (proxy) is reduced to its title."""
+    t = r.text or ""
+    if "<html" in t[:300].lower():
+        m = re.search(r"<title>(.*?)</title>", t, re.S | re.I)
+        return (m.group(1).strip() if m else "html page")[:80]
+    return t[:200]
+
+
 def tg_up(tid, path, name, cb=None):
-    """Send a PDF as raw binary to the storage /upload endpoint. Resumes from where it stopped if the link breaks."""
+    """Send a PDF to the storage /upload endpoint in pieces (a multiple of the storage chunk each; the proxy in front
+    of the storage refuses one huge request with 413). Resumes from where it stopped if the link breaks."""
     size = os.path.getsize(path)
-    fails = busy = 0
+    fails = waits = 0
+    pc = UP_PIECE_CHUNKS
     while True:
         body = None
         try:
@@ -669,19 +685,33 @@ def tg_up(tid, path, name, cb=None):
             st = r.json() if r.status_code == 200 else {}
             if st.get("done"):
                 return tid
+            if st.get("busy"):  # the storage is still saving the last piece
+                waits += 1
+                if waits > 300:
+                    raise StorageRefused("storage stays busy")
+                time.sleep(2)
+                continue
             have = int(st.get("stored", 0)) if r.status_code == 200 else 0
-            body = _UploadBody(path, have, size, cb) if size > have else b""
+            end = min(have + pc * STORE_CHUNK, size)
+            body = _UploadBody(path, have, size, cb, end) if end > have else b""
             u = f"{STORE_BASE}/upload?" + urlencode({"id": tid, "name": name, "offset": have, "size": size})
             r = requests.post(u, data=body, headers={"Content-Type": "application/octet-stream"}, timeout=(15, 900))
-            if r.status_code == 200 and r.json().get("done"):
-                return tid
-            last = f"HTTP {r.status_code} {r.text[:200]}"
-            if r.status_code == 409 and "already running" in r.text:
+            if r.status_code == 200:
+                fails = waits = 0
+                if r.json().get("done"):
+                    return tid
+                continue  # piece stored, send the next one
+            last = f"HTTP {r.status_code} {_short(r)}"
+            if r.status_code == 413 and "<html" in (r.text or "")[:300].lower() and pc > 1:
+                pc -= 1  # the proxy refuses requests this big: use smaller pieces
+                app.logger.warning("proxy said 413, pieces are now %d chunk(s)", pc)
+                continue
+            if r.status_code == 409 and "already running" in (r.text or ""):
                 # an earlier, cut connection is still being closed on the storage side: wait for it, don't give up
-                busy += 1
-                if busy > 40:
+                waits += 1
+                if waits > 300:
                     raise StorageRefused(last)
-                time.sleep(15)
+                time.sleep(5)
                 continue
             if r.status_code in (400, 401, 403, 404, 413, 503):  # storage refuses (no bot enabled, too big...): not worth retrying
                 raise StorageRefused(last)
