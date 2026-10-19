@@ -903,6 +903,10 @@ def build_pdf(paths, out):
                     buf = BytesIO()
                     im.convert("RGB").save(buf, "JPEG", quality=88)
                     data, cs = buf.getvalue(), "/DeviceRGB"
+            try:
+                os.remove(p)
+            except OSError:
+                pass
             sc = min(1.0, 14000.0 / max(w, h))
             pw, ph = w * sc, h * sc
             page, cont, img = 3 + 3 * i, 4 + 3 * i, 5 + 3 * i
@@ -928,6 +932,31 @@ def build_pdf(paths, out):
 
 # ----------------------------------------------------------------- chapters / queue
 _CH = {}
+CONV_LOCK = threading.Lock()
+# Free image service (wsrv.nl) fetches the picture itself and hands back a ready JPEG, so this server does no
+# webp/png decoding at all. Set CONVERT_SERVICE= (empty) to turn it off. Any failure falls back to local convert.
+CONVERT_SERVICE = os.environ.get("CONVERT_SERVICE", "https://wsrv.nl/").strip()
+_WS = {"fail": 0, "off": 0.0}
+
+
+def fetch_via_service(url):
+    """Returns (jpeg_bytes, 'image/jpeg') from the free converter, or None (caller then does it locally)."""
+    if not CONVERT_SERVICE or time.time() < _WS["off"]:
+        return None
+    if urlparse(url).path.lower().endswith((".jpg", ".jpeg")):  # already JPEG: no conversion needed, skip the extra hop
+        return None
+    try:
+        r = http.get(CONVERT_SERVICE, params={"url": url, "output": "jpg", "q": "85"}, timeout=40)
+        ok = r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image/jpeg") and len(r.content) > 1500
+    except requests.RequestException:
+        ok = False
+    if not ok:
+        _WS["fail"] += 1
+        if _WS["fail"] >= 5:  # service blocked/down: stop trying for 10 minutes
+            _WS["fail"], _WS["off"] = 0, time.time() + 600
+        return None
+    _WS["fail"] = 0
+    return r.content, "image/jpeg"
 ERRLOG = deque(maxlen=40)
 
 
@@ -944,7 +973,7 @@ def cfetch(path, params=None, ttl=120, tries=2):
             return c[1]
         raise
     _CH[key] = (time.time(), soup)
-    if len(_CH) > 120:
+    if len(_CH) > 30:
         _CH.pop(next(iter(_CH)))
     return soup
 
@@ -970,7 +999,7 @@ def manga_info(slug, fresh=False, ttl=180):
     m["chs"] = chs
     m["cover"] = m.get("image_url")
     _CH[key] = (time.time(), m)
-    if len(_CH) > 120:
+    if len(_CH) > 30:
         _CH.pop(next(iter(_CH)))
     return m
 
@@ -1266,16 +1295,29 @@ def fetch_chapter_images(job, tmp, ci, c):
             raise RuntimeError("cancelled")
         res = None
         for k in range(3):
-            res = fetch_image(url)
+            res = (fetch_via_service(url) if k == 0 else None) or fetch_image(url)
             if res:
                 break
             cnt["fail"] += 1
             time.sleep(1.0 * (k + 1))
         if not res:
             raise RuntimeError(f"image {idx} failed")
-        path = os.path.join(tmp, f"{ci:03d}_{idx:04d}.{EXT.get(res[1], 'jpg')}")
+        data, ctype = res
+        ext = EXT.get(ctype, "jpg")
+        if ctype != "image/jpeg" and Image is not None:
+            # convert webp/png to JPEG right here, while other images are still downloading
+            # (Pillow releases the GIL, so this overlaps with the network instead of adding a slow build step later)
+            try:
+                with CONV_LOCK:  # one decoded image in RAM at a time (tall webtoon strips are big when decoded)
+                    with Image.open(BytesIO(data)) as im:
+                        buf = BytesIO()
+                        im.convert("RGB").save(buf, "JPEG", quality=85)
+                    data, ext = buf.getvalue(), "jpg"
+            except Exception:
+                pass  # keep the original, build_pdf can still convert it
+        path = os.path.join(tmp, f"{ci:03d}_{idx:04d}.{ext}")
         with open(path, "wb") as fh:
-            fh.write(res[0])
+            fh.write(data)
         cnt["ok"] += 1
         job["cur_ok"] = cnt["ok"]
         job["msg"] = f'{c["name"]}  image {cnt["ok"]}/{n}'
