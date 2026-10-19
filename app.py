@@ -1884,7 +1884,7 @@ body.hide #hb{transform:translateY(-105%)}body.hide #fb{transform:translateY(105
 #fb a{padding:9px 18px;border-radius:12px;background:#22252e;font-weight:650}#fb a.off{opacity:.3;pointer-events:none}#pgi{color:#9aa0b0;font-size:13px}
 .pn{display:block;width:100%;min-height:260px;background:#0c0c0c}.dv{padding:30px 14px;text-align:center;font-weight:700;color:#aab;border-top:1px solid #222;background:#111}
 #rd{padding-top:0}#end{text-align:center;color:#8b90a0;padding:46px 14px calc(90px + env(safe-area-inset-bottom))}#end a{color:#8f82ff}
-#ov{position:fixed;inset:0;background:#000;z-index:9;display:flex;align-items:center;justify-content:center;color:#9aa0b0}</style>
+#ov{position:fixed;inset:0;background:#000;z-index:9;display:flex;align-items:center;justify-content:center;color:#9aa0b0}#ov[hidden]{display:none}</style>
 <div id=hb><a id=bk href="/m/{{d.slug}}">‹</a><span id=tt>{{d.mtitle}} · {{d.cname}}</span></div>
 <div id=ov hidden>Resuming where you left off… <small style="margin-left:8px;opacity:.6">tap to skip</small></div><div id=rd></div><div id=end>Loading next chapter…</div>
 <div id=fb><a id=pv href=#>‹ Prev</a><span id=pgi></span><a id=nx href=#>Next ›</a></div>
