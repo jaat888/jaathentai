@@ -477,6 +477,8 @@ PER_INSERT = 3                                                     # rows per IN
 UP_PAR = max(1, min(int(os.environ.get("UP_PAR", "4")), 8))        # parallel INSERT requests
 DL_PAR = 4                                                         # parallel chunk reads while downloading a PDF
 IMG_PAR = max(1, min(int(os.environ.get("IMG_PAR", "6")), 24))    # parallel image downloads + conversions
+STREAM_UP = os.environ.get("STREAM_UP", "1") != "0"                     # upload a PDF while it is still being built (needs the new storage app.py)
+UP_FILES = max(1, min(int(os.environ.get("UP_FILES", "2")), 4))     # PDFs uploading at the same time (while the next one is being built)
 NUM_WORKERS = max(1, min(int(os.environ.get("JOB_WORKERS", "1")), 4))  # jobs running at the same time
 USER_MAX_CH = int(os.environ.get("USER_MAX_CH", "0"))              # chapters per request for normal users (0 = no limit)
 AUTO_MIN = max(10, int(os.environ.get("AUTO_MIN", "360")))            # auto-update check every N minutes
@@ -673,7 +675,7 @@ STORE_BASE = SQL_BASE[:-4] if SQL_BASE.endswith("/sql") else SQL_BASE   # .../p/
 
 
 STORE_CHUNK = int(float(os.environ.get("STORE_CHUNK_MB", "18")) * 1048576)   # must be the same as CHUNK_MB of the storage
-UP_PIECE_CHUNKS = max(1, min(int(os.environ.get("UP_PIECE_CHUNKS", "2")), 4))    # storage chunks sent per request (its own dashboard sends 2-4)
+UP_PIECE_CHUNKS = max(1, min(int(os.environ.get("UP_PIECE_CHUNKS", "4")), 4))    # storage chunks sent per request (its own dashboard sends 2-4)
 
 
 class _UploadBody:
@@ -827,7 +829,7 @@ def store_pdf(path, name, slug, uid, cb=None, stop=None, ids=None, on_ids=None):
             on_ids(fid, tid)
     try:
         tg_up(tid, path, name, cb, stop)
-        sql("update files set tg=?, parts=1 where id=?", [tid, fid])  # parts>0 = finished; only then it shows in Library
+        sql("update files set tg=?, parts=1, size=?, name=? where id=?", [tid, size, name, fid])  # parts>0 = finished; only then it shows in Library
         return fid
     except Cancelled:
         tg_rm(tid)
@@ -1433,14 +1435,21 @@ class PdfStream:
         self.f.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
         self.off = []          # byte offset of every page's 3 objects, 3 per page
         self.dim = 0
+        self.lock = threading.Lock()
+        self.committed = self.f.tell()   # bytes that are complete pages: a streaming upload may read up to here
+        self.rolled_to = None            # lowest position a rollback cut the file back to
+        self.wake = None                 # Event: set whenever a page is complete (wakes the streaming upload)
 
     def mark(self):
         return (self.f.tell(), len(self.off))
 
     def rollback(self, m):
-        self.f.truncate(m[0])
-        self.f.seek(m[0])
-        del self.off[m[1]:]
+        with self.lock:
+            self.f.truncate(m[0])
+            self.f.seek(m[0])
+            del self.off[m[1]:]
+            self.committed = min(self.committed, m[0])
+            self.rolled_to = m[0] if self.rolled_to is None else min(self.rolled_to, m[0])
 
     def pages(self):
         return len(self.off) // 3
@@ -1470,6 +1479,11 @@ class PdfStream:
                  f"/BitsPerComponent 8 /Filter /DCTDecode /Length {len(data)} >>\nstream\n").encode())
         f.write(data)
         f.write(b"\nendstream\nendobj\n")
+        f.flush()
+        with self.lock:
+            self.committed = f.tell()
+        if self.wake:
+            self.wake.set()
 
     def close(self):
         f, n = self.f, self.pages()
@@ -1499,6 +1513,108 @@ class PdfStream:
             os.remove(self.path)
         except OSError:
             pass
+
+
+class StreamUp:
+    """Uploads the finished part of a PDF WHILE it is still being written (picture download and upload overlap).
+    The storage gets the file as an open-ended file (size=-1), always in whole chunks; the real size is sent with the
+    last piece. If a chapter fails and the PDF is cut back below what was already sent, the early upload is thrown away
+    and the normal upload after the PDF is finished takes over, so the result is always a correct file."""
+
+    def __init__(self, job, writer, name, on_ids):
+        self.job, self.w, self.name, self.on_ids = job, writer, name, on_ids
+        self.sent = 0
+        self.fid = self.tid = None
+        self.stop = False
+        self.dead = False
+        self.ev = threading.Event()
+        writer.wake = self.ev
+        self.th = threading.Thread(target=self.run, daemon=True)
+        self.th.start()
+
+    def _open(self):
+        j = sql("insert into files(slug, name, size, parts, created, uid) values(?,?,?,0,datetime('now'),?)",
+                [self.job["slug"], self.name, 0, self.job["uid"]])
+        self.fid = j.get("last_id") or q("select max(id) as m from files")[0][0]["m"]
+        self.tid = f"pdf{self.fid}x{int(time.time())}"
+        self.on_ids(self.fid, self.tid)
+
+    def _give_up(self):
+        """Forget what was sent early; the normal upload starts from 0 with a fresh storage id."""
+        self.dead = True
+        old, self.sent = self.tid, 0
+        if old:
+            tg_rm(old)
+            self.tid = f"pdf{self.fid}x{int(time.time())}r"
+            self.on_ids(self.fid, self.tid)
+
+    def _bad(self):
+        with self.w.lock:
+            return self.w.rolled_to is not None and self.w.rolled_to < self.sent
+
+    def run(self):
+        fails = 0
+        try:
+            while not self.stop and not self.dead and not self.job["cancel"]:
+                self.ev.clear()
+                with self.w.lock:
+                    avail = (self.w.committed // STORE_CHUNK) * STORE_CHUNK
+                n = min(avail - self.sent, UP_PIECE_CHUNKS * STORE_CHUNK)
+                if n < STORE_CHUNK:
+                    self.ev.wait(2.0)
+                    continue
+                if not self.tid:
+                    self._open()
+                body = _UploadBody(self.w.path, self.sent, self.sent + n, None, self.sent + n, lambda: self.job["cancel"])
+                try:
+                    u = f"{STORE_BASE}/upload?" + urlencode({"id": self.tid, "name": self.name, "offset": self.sent, "size": -1})
+                    r = requests.post(u, data=body, headers={"Content-Type": "application/octet-stream"}, timeout=(15, 900))
+                    if r.status_code == 200:
+                        self.sent += n
+                        fails = 0
+                        if self._bad():
+                            raise RuntimeError("PDF was cut back after it was sent")
+                        continue
+                    raise RuntimeError(f"HTTP {r.status_code} {_short(r)}")
+                except Exception as ex:
+                    if self.job["cancel"]:
+                        return
+                    fails += 1
+                    app.logger.warning("stream upload try %d failed: %s", fails, str(ex)[:200])
+                    if fails >= 3 or "cut back" in str(ex):
+                        raise
+                    try:  # realign with what the storage really holds
+                        st = sqlhttp.get(f"{STORE_BASE}/status/{self.tid}", timeout=30).json()
+                        self.sent = int(st.get("stored", 0)) // STORE_CHUNK * STORE_CHUNK
+                    except Exception:
+                        pass
+                    time.sleep(2 * fails)
+                finally:
+                    body.close()
+        except Exception as ex:
+            app.logger.warning("stream upload given up, normal upload follows: %s", str(ex)[:200])
+            self._give_up()
+
+    def finish(self):
+        """PDF is complete: stop the early upload. Returns ids for the normal upload, which continues from what is stored."""
+        self.stop = True
+        self.ev.set()
+        self.th.join()
+        if not self.dead and self.tid and self._bad():
+            self._give_up()
+        return {"fid": self.fid, "tid": self.tid} if self.fid else {}
+
+    def abort(self):
+        self.stop = True
+        self.ev.set()
+        self.th.join()
+        if self.tid:
+            tg_rm(self.tid)
+        if self.fid:
+            try:
+                sql("delete from files where id=?", [self.fid])
+            except Exception:
+                pass
 
 
 def fetch_panel(job, url, cnt):
@@ -1557,7 +1673,7 @@ def stream_chapter(job, writer, c):
 
 def run_job(job):
     chs, per = job["chapters"], job["per"]
-    up = ThreadPoolExecutor(1)
+    up = ThreadPoolExecutor(UP_FILES)
     pend = []
     try:
         for g in range(0, len(chs), per):
@@ -1579,7 +1695,16 @@ def run_job(job):
                 else:
                     okc = []
                     part = pdf + ".part"
+                    old_ids = (_meta_read(tmp) or {}).get("ids") or {}
+                    if old_ids.get("tid"):  # leftovers of an earlier, interrupted try: that PDF is rebuilt, so start clean
+                        tg_rm(old_ids["tid"])
+                        _meta_write(tmp, ids={})
                     writer = PdfStream(part)
+                    su = None
+                    if STREAM_UP:
+                        f1, l1 = chap_label(group[0]), chap_label(group[-1])
+                        guess = f'{safe(job["title"])} - Chapter {f1}.pdf' if len(group) == 1 else f'{safe(job["title"])} - Ch {f1}-{l1}.pdf'
+                        su = StreamUp(job, writer, guess, lambda fid, tid, _t=tmp: _meta_write(_t, ids={"fid": fid, "tid": tid}))
                     t0 = time.time()
                     try:
                         for c in group:
@@ -1599,6 +1724,8 @@ def run_job(job):
                             job["cur_n"] = job["cur_ok"] = 0
                         if job["cancel"] or not okc:
                             writer.abort()
+                            if su:
+                                su.abort()
                             if job["cancel"]:
                                 break
                             handed = True  # nothing to keep
@@ -1607,18 +1734,21 @@ def run_job(job):
                         writer.close()
                     except BaseException:
                         writer.abort()
+                        if su:
+                            su.abort()
                         raise
                     os.replace(part, pdf)
+                    sids = su.finish() if su else {}
                     first, last = chap_label(okc[0]), chap_label(okc[-1])
                     name = f'{safe(job["title"])} - Chapter {first}.pdf' if len(okc) == 1 else \
                            f'{safe(job["title"])} - Ch {first}-{last}.pdf'
-                    _meta_write(tmp, name=name, okc=okc, slug=job["slug"], uid=job["uid"])
+                    _meta_write(tmp, name=name, okc=okc, slug=job["slug"], uid=job["uid"], **({"ids": sids} if sids else {}))
                     job["t"]["pdf"] += time.time() - t0
                 if job["cancel"]:
                     break
                 pend.append(up.submit(finish_group, job, tmp, pdf, name, okc))
                 handed = True
-                while pend and (len(pend) > 1 or mem_low()):  # at most one upload waiting; none when memory is tight
+                while pend and (len(pend) > UP_FILES or mem_low()):  # a few uploads run while the next PDF is built; none waiting when memory is tight
                     pend.pop(0).result()
             except Exception as e:
                 job["errors"].append(f"PDF group {g // per + 1}: {str(e)[:150]}")
