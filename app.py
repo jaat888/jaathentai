@@ -476,8 +476,8 @@ CHUNK = max(32, int(os.environ.get("CHUNK_KB", "192"))) * 1024   # raw bytes per
 PER_INSERT = 3                                                     # rows per INSERT request
 UP_PAR = max(1, min(int(os.environ.get("UP_PAR", "4")), 8))        # parallel INSERT requests
 DL_PAR = 4                                                         # parallel chunk reads while downloading a PDF
-IMG_PAR = max(1, min(int(os.environ.get("IMG_PAR", "12")), 24))    # parallel image downloads + conversions
-NUM_WORKERS = max(1, min(int(os.environ.get("JOB_WORKERS", "2")), 4))  # jobs running at the same time
+IMG_PAR = max(1, min(int(os.environ.get("IMG_PAR", "6")), 24))    # parallel image downloads + conversions
+NUM_WORKERS = max(1, min(int(os.environ.get("JOB_WORKERS", "1")), 4))  # jobs running at the same time
 USER_MAX_CH = int(os.environ.get("USER_MAX_CH", "0"))              # chapters per request for normal users (0 = no limit)
 AUTO_MIN = max(10, int(os.environ.get("AUTO_MIN", "360")))            # auto-update check every N minutes
 USER_MAX_JOBS = 2                                                  # active jobs per normal user
@@ -492,9 +492,56 @@ JOBS_LOCK = threading.Lock()
 _job_ids = itertools.count(1)
 # Work folder that survives a crash/restart of the app: downloaded images and finished PDFs stay here until uploaded,
 # so a restart continues instead of downloading everything again.
-SPOOL = os.environ.get("SPOOL_DIR") or os.path.join(tempfile.gettempdir(), "hjspool")
+SPOOL = os.environ.get("SPOOL_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".spool")
 SPOOL_KEEP = int(os.environ.get("SPOOL_KEEP_MIN", "150")) * 60
-os.makedirs(SPOOL, exist_ok=True)
+try:
+    os.makedirs(SPOOL, exist_ok=True)
+    _tp = os.path.join(SPOOL, ".w")
+    open(_tp, "w").close()
+    os.remove(_tp)
+except OSError:  # app folder is read-only: fall back to the temp folder
+    SPOOL = os.path.join(tempfile.gettempdir(), "hjspool")
+    os.makedirs(SPOOL, exist_ok=True)
+
+
+def _rd(path):
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+_MEM = {"t": 0.0, "v": False}
+
+
+def mem_low(limit=0.78):
+    """True when the container's real memory (program + RAM-backed files, not the reclaimable file cache) is close to its limit."""
+    now = time.time()
+    if now - _MEM["t"] < 1.0:
+        return _MEM["v"]
+    v = False
+    try:
+        mx, st = _rd("/sys/fs/cgroup/memory.max"), _rd("/sys/fs/cgroup/memory.stat")
+        if mx and st and mx.strip() != "max":
+            d = dict(l.split() for l in st.splitlines() if len(l.split()) == 2)
+            v = (int(d.get("anon", 0)) + int(d.get("shmem", 0))) > limit * int(mx)
+        else:
+            mx, st = _rd("/sys/fs/cgroup/memory/memory.limit_in_bytes"), _rd("/sys/fs/cgroup/memory/memory.stat")
+            if mx and st and int(mx) < (1 << 50):
+                d = dict(l.split() for l in st.splitlines() if len(l.split()) == 2)
+                v = (int(d.get("rss", 0)) + int(d.get("shmem", 0))) > limit * int(mx)
+    except Exception:
+        v = False
+    _MEM["t"], _MEM["v"] = now, v
+    return v
+
+
+def wait_mem(job, secs=90):
+    """Pause new work while memory is nearly full (other downloads finish and free it); never forever."""
+    end = time.time() + secs
+    while mem_low() and not job["cancel"] and time.time() < end:
+        time.sleep(1)
 EXT = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}
 
 sqlhttp = requests.Session()
@@ -978,7 +1025,7 @@ def build_pdf(paths, out):
 
 # ----------------------------------------------------------------- chapters / queue
 _CH = {}
-CONV_LOCK = threading.Semaphore(int(os.environ.get("CONV_PAR", "3")))
+CONV_LOCK = threading.Semaphore(int(os.environ.get("CONV_PAR", "2")))
 # Free image service (wsrv.nl) fetches the picture itself and hands back a ready JPEG, so this server does no
 # webp/png decoding at all. Set CONVERT_SERVICE= (empty) to turn it off. Any failure falls back to local convert.
 CONVERT_SERVICE = os.environ.get("CONVERT_SERVICE", "https://wsrv.nl/,https://images.weserv.nl/").strip()
@@ -1376,6 +1423,138 @@ def finish_group(job, tmp, pdf, name, okc):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class PdfStream:
+    """Writes the PDF while the pictures arrive: one picture in RAM, nothing is stored as separate files.
+    A chapter that fails half way is rolled back, so the PDF never has half a chapter."""
+
+    def __init__(self, path):
+        self.path = path
+        self.f = open(path, "wb")
+        self.f.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        self.off = []          # byte offset of every page's 3 objects, 3 per page
+        self.dim = 0
+
+    def mark(self):
+        return (self.f.tell(), len(self.off))
+
+    def rollback(self, m):
+        self.f.truncate(m[0])
+        self.f.seek(m[0])
+        del self.off[m[1]:]
+
+    def pages(self):
+        return len(self.off) // 3
+
+    def add(self, data):
+        with Image.open(BytesIO(data)) as im:
+            w, h = im.size
+            if im.format == "JPEG" and im.mode in ("RGB", "L"):
+                cs = "/DeviceRGB" if im.mode == "RGB" else "/DeviceGray"
+            else:
+                buf = BytesIO()
+                im.convert("RGB").save(buf, "JPEG", quality=88)
+                data, cs = buf.getvalue(), "/DeviceRGB"
+        sc = min(1.0, 14000.0 / max(w, h))
+        pw, ph = w * sc, h * sc
+        i = self.pages()
+        page, cont, img = 3 + 3 * i, 4 + 3 * i, 5 + 3 * i
+        f = self.f
+        self.off.append(f.tell())
+        f.write(f"{page} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {pw:.2f} {ph:.2f}] "
+                f"/Resources << /XObject << /Im0 {img} 0 R >> >> /Contents {cont} 0 R >>\nendobj\n".encode())
+        c = f"q {pw:.2f} 0 0 {ph:.2f} 0 0 cm /Im0 Do Q".encode()
+        self.off.append(f.tell())
+        f.write(f"{cont} 0 obj\n<< /Length {len(c)} >>\nstream\n".encode() + c + b"\nendstream\nendobj\n")
+        self.off.append(f.tell())
+        f.write((f"{img} 0 obj\n<< /Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace {cs} "
+                 f"/BitsPerComponent 8 /Filter /DCTDecode /Length {len(data)} >>\nstream\n").encode())
+        f.write(data)
+        f.write(b"\nendstream\nendobj\n")
+
+    def close(self):
+        f, n = self.f, self.pages()
+        offs = {}
+        offs[1] = f.tell()
+        f.write(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+        offs[2] = f.tell()
+        kids = " ".join(f"{3 + 3 * i} 0 R" for i in range(n))
+        f.write(f"2 0 obj\n<< /Type /Pages /Count {n} /Kids [{kids}] >>\nendobj\n".encode())
+        for k, o in enumerate(self.off):
+            offs[3 + k] = o
+        total = 2 + 3 * n
+        xref = f.tell()
+        f.write(f"xref\n0 {total + 1}\n".encode())
+        f.write(b"0000000000 65535 f \n")
+        for num in range(1, total + 1):
+            f.write(f"{offs[num]:010d} 00000 n \n".encode())
+        f.write(f"trailer\n<< /Size {total + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+        f.close()
+
+    def abort(self):
+        try:
+            self.f.close()
+        except Exception:
+            pass
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+
+def fetch_panel(job, url, cnt):
+    """One picture as JPEG-ready bytes (wsrv first, direct download as fallback)."""
+    if job["cancel"]:
+        raise RuntimeError("cancelled")
+    wait_mem(job)
+    res = None
+    for k in range(3):
+        res = (fetch_via_service(url) if k == 0 else None) or fetch_image(url)
+        if res:
+            break
+        cnt["fail"] += 1
+        time.sleep(0.5 * (k + 1))
+    if not res:
+        raise RuntimeError("image failed")
+    return prep_image(*res)[0]
+
+
+def stream_chapter(job, writer, c):
+    """Download one chapter and write its pictures into the PDF in the right order."""
+    panels = parse_panels(c["chapter_id"], fetch_html(f"/{c['chapter_id']}/"))["panels"]
+    if not panels:
+        raise RuntimeError("no images found")
+    n = len(panels)
+    job["cur_n"], job["cur_ok"] = n, 0
+    cnt = {"fail": 0}
+    t0 = time.time()
+    ahead = max(2, job["par"] * 2)  # pictures requested ahead of the one being written
+    with ThreadPoolExecutor(max_workers=job["par"]) as ex:
+        urls = iter(p["image_url"] for p in panels)
+        win = deque()
+        try:
+            for _ in range(ahead):
+                u = next(urls, None)
+                if u is None:
+                    break
+                win.append(ex.submit(fetch_panel, job, u, cnt))
+            while win:
+                data = win.popleft().result()
+                writer.add(data)
+                del data
+                job["cur_ok"] += 1
+                job["msg"] = f'{c["name"]}  image {job["cur_ok"]}/{n}'
+                u = next(urls, None)
+                if u is not None:
+                    win.append(ex.submit(fetch_panel, job, u, cnt))
+        except Exception:
+            for f in win:
+                f.cancel()
+            raise
+    if cnt["fail"] >= 3:  # site is pushing back, slow down for the rest of this job
+        job["par"] = max(3, job["par"] - 1)
+    job["t"]["img"] += time.time() - t0
+
+
 def run_job(job):
     chs, per = job["chapters"], job["per"]
     up = ThreadPoolExecutor(1)
@@ -1387,7 +1566,6 @@ def run_job(job):
             group = chs[g:g + per]
             tmp = group_dir(job, group)
             handed = False
-            files = []
             try:
                 pdf = os.path.join(tmp, "out.pdf")
                 meta = _meta_read(tmp)
@@ -1400,44 +1578,47 @@ def run_job(job):
                     job["msg"] = f"Continuing upload: {name}"
                 else:
                     okc = []
-                    for ci, c in enumerate(group):
-                        try:
-                            files += fetch_chapter_images(job, tmp, ci, c)
-                            okc.append(c)
-                        except Exception as e:  # skip this chapter, keep going
-                            if not job["cancel"]:
-                                job["errors"].append(f'{c["name"]}: {str(e)[:120]}')
-                                job["failed"].append(c)
-                        if job["cancel"]:
-                            break
-                        job["done"] += 1
-                        job["cur_n"] = job["cur_ok"] = 0
-                    if job["cancel"]:
-                        break
-                    if not files:
-                        shutil.rmtree(tmp, ignore_errors=True)
-                        handed = True  # nothing to keep
-                        continue
+                    part = pdf + ".part"
+                    writer = PdfStream(part)
+                    t0 = time.time()
+                    try:
+                        for c in group:
+                            mk = writer.mark()
+                            job["msg"] = f'{c["name"]}'
+                            try:
+                                stream_chapter(job, writer, c)
+                                okc.append(c)
+                            except Exception as e:  # skip this chapter (nothing of it stays in the PDF), keep going
+                                writer.rollback(mk)
+                                if not job["cancel"]:
+                                    job["errors"].append(f'{c["name"]}: {str(e)[:120]}')
+                                    job["failed"].append(c)
+                            if job["cancel"]:
+                                break
+                            job["done"] += 1
+                            job["cur_n"] = job["cur_ok"] = 0
+                        if job["cancel"] or not okc:
+                            writer.abort()
+                            if job["cancel"]:
+                                break
+                            handed = True  # nothing to keep
+                            shutil.rmtree(tmp, ignore_errors=True)
+                            continue
+                        writer.close()
+                    except BaseException:
+                        writer.abort()
+                        raise
+                    os.replace(part, pdf)
                     first, last = chap_label(okc[0]), chap_label(okc[-1])
                     name = f'{safe(job["title"])} - Chapter {first}.pdf' if len(okc) == 1 else \
                            f'{safe(job["title"])} - Ch {first}-{last}.pdf'
-                    job["msg"] = f"Building PDF: {name}"
-                    t0 = time.time()
-                    part = pdf + ".part"
-                    build_pdf(files, part)
-                    os.replace(part, pdf)
                     _meta_write(tmp, name=name, okc=okc, slug=job["slug"], uid=job["uid"])
                     job["t"]["pdf"] += time.time() - t0
-                    for p in files:  # images are inside the PDF now, free the disk
-                        try:
-                            os.remove(p)
-                        except OSError:
-                            pass
                 if job["cancel"]:
                     break
                 pend.append(up.submit(finish_group, job, tmp, pdf, name, okc))
                 handed = True
-                while len(pend) > 1:  # at most one upload waiting, so disk/memory stay small
+                while pend and (len(pend) > 1 or mem_low()):  # at most one upload waiting; none when memory is tight
                     pend.pop(0).result()
             except Exception as e:
                 job["errors"].append(f"PDF group {g // per + 1}: {str(e)[:150]}")
@@ -1477,6 +1658,7 @@ def fetch_chapter_images(job, tmp, ci, c):
     def one(idx, url):
         if job["cancel"]:
             raise RuntimeError("cancelled")
+        wait_mem(job)
         res = None
         for k in range(3):
             res = (fetch_via_service(url) if k == 0 else None) or fetch_image(url)
