@@ -475,9 +475,8 @@ SQL_URL = SQL_BASE if SQL_BASE.endswith("/sql") else SQL_BASE + "/sql"
 CHUNK = max(32, int(os.environ.get("CHUNK_KB", "192"))) * 1024   # raw bytes per DB row
 PER_INSERT = 3                                                     # rows per INSERT request
 UP_PAR = max(1, min(int(os.environ.get("UP_PAR", "4")), 8))        # parallel INSERT requests
-FAST_STORE = os.environ.get("FAST_STORE", "1") != "0"                  # PDFs go straight to the storage file API (binary, resumable)
 DL_PAR = 4                                                         # parallel chunk reads while downloading a PDF
-IMG_PAR = max(1, min(int(os.environ.get("IMG_PAR", "6")), 10))     # parallel image downloads
+IMG_PAR = max(1, min(int(os.environ.get("IMG_PAR", "12")), 24))    # parallel image downloads + conversions
 NUM_WORKERS = max(1, min(int(os.environ.get("JOB_WORKERS", "2")), 4))  # jobs running at the same time
 USER_MAX_CH = int(os.environ.get("USER_MAX_CH", "0"))              # chapters per request for normal users (0 = no limit)
 AUTO_MIN = max(10, int(os.environ.get("AUTO_MIN", "360")))            # auto-update check every N minutes
@@ -621,51 +620,83 @@ def save_state(uid, st):
 STORE_BASE = SQL_BASE[:-4] if SQL_BASE.endswith("/sql") else SQL_BASE   # .../p/KEY
 
 
+class _UploadBody:
+    """File-like upload body with a known length. With it requests sends a plain Content-Length.
+    (A generator body made requests send 'Transfer-Encoding: chunked' AS WELL as Content-Length; a proxy in front
+    of the storage then reads the raw bytes as chunks and the upload breaks.)"""
+
+    def __init__(self, path, offset, size, cb=None):
+        self.f = open(path, "rb")
+        self.f.seek(offset)
+        self.start, self.total, self.size, self.cb = offset, size - offset, size, cb
+        self.sent, self._mark = offset, offset
+
+    def __len__(self):
+        return self.total
+
+    def read(self, n=-1):
+        left = self.total - (self.sent - self.start)
+        if left <= 0:
+            return b""
+        if n is None or n < 0 or n > (1 << 20):
+            n = 1 << 20
+        b = self.f.read(min(n, left))
+        self.sent += len(b)
+        if self.cb and self.sent - self._mark >= (1 << 20):
+            self._mark = self.sent
+            self.cb(min(0.99, self.sent / max(self.size, 1)))
+        return b
+
+    def close(self):
+        try:
+            self.f.close()
+        except Exception:
+            pass
+
+
+class StorageRefused(Exception):
+    pass
+
+
 def tg_up(tid, path, name, cb=None):
     """Send a PDF as raw binary to the storage /upload endpoint. Resumes from where it stopped if the link breaks."""
     size = os.path.getsize(path)
-    fails = 0
+    fails = busy = 0
     while True:
+        body = None
         try:
             r = sqlhttp.get(f"{STORE_BASE}/status/{tid}", timeout=30)
             st = r.json() if r.status_code == 200 else {}
             if st.get("done"):
                 return tid
             have = int(st.get("stored", 0)) if r.status_code == 200 else 0
-
-            def body():
-                sent = have
-                with open(path, "rb") as f:
-                    f.seek(have)
-                    while True:
-                        b = f.read(1 << 20)
-                        if not b:
-                            break
-                        sent += len(b)
-                        if cb:
-                            cb(min(0.99, sent / max(size, 1)))
-                        yield b
-
+            body = _UploadBody(path, have, size, cb) if size > have else b""
             u = f"{STORE_BASE}/upload?" + urlencode({"id": tid, "name": name, "offset": have, "size": size})
-            r = requests.post(u, data=body(), headers={"Content-Length": str(size - have),
-                                                       "Content-Type": "application/octet-stream"}, timeout=(15, 900))
+            r = requests.post(u, data=body, headers={"Content-Type": "application/octet-stream"}, timeout=(15, 900))
             if r.status_code == 200 and r.json().get("done"):
                 return tid
+            last = f"HTTP {r.status_code} {r.text[:200]}"
+            if r.status_code == 409 and "already running" in r.text:
+                # an earlier, cut connection is still being closed on the storage side: wait for it, don't give up
+                busy += 1
+                if busy > 40:
+                    raise StorageRefused(last)
+                time.sleep(15)
+                continue
             if r.status_code in (400, 401, 403, 404, 413, 503):  # storage refuses (no bot enabled, too big...): not worth retrying
-                raise StorageRefused(f"HTTP {r.status_code} {r.text[:150]}")
-            raise RuntimeError(f"HTTP {r.status_code} {r.text[:150]}")
+                raise StorageRefused(last)
+            raise RuntimeError(last)
         except StorageRefused:
             raise
         except Exception as ex:
             fails += 1
-            app.logger.warning("fast upload try %d failed: %s", fails, str(ex)[:150])
-            if fails >= 8:
-                raise
-            time.sleep(min(2 * fails, 15))
-
-
-class StorageRefused(Exception):
-    pass
+            app.logger.warning("upload try %d failed: %s", fails, str(ex)[:200])
+            if fails >= 10:
+                raise RuntimeError(f"upload failed after {fails} tries: {str(ex)[:200]}")
+            time.sleep(min(2 * fails, 20))
+        finally:
+            if hasattr(body, "close"):
+                body.close()
 
 
 def tg_rm(tid):
@@ -678,74 +709,27 @@ def tg_rm(tid):
 
 
 def store_pdf(path, name, slug, uid, cb=None):
-    """Store a PDF: fast binary upload to the storage file API; on any trouble fall back to the old SQL way."""
-    if FAST_STORE:
-        init_schema()
-        size = os.path.getsize(path)
-        j = sql("insert into files(slug, name, size, parts, created, uid) values(?,?,?,0,datetime('now'),?)",
-                [slug, name, size, uid])
-        fid = j.get("last_id") or q("select max(id) as m from files")[0][0]["m"]
-        tid = f"pdf{fid}x{int(time.time())}"
-        try:
-            tid = tg_up(tid, path, name, cb)
-            sql("update files set tg=?, parts=1 where id=?", [tid, fid])  # parts>0 = finished; only then it shows in Library
-            return fid
-        except Exception as ex:
-            app.logger.warning("fast store failed (%s), using SQL storage", str(ex)[:150])
-            tg_rm(tid)
-            try:
-                sql("delete from files where id=?", [fid])
-            except Exception:
-                pass
-    return store_pdf_sql(path, name, slug, uid, cb)
-
-
-def store_pdf_sql(path, name, slug, uid, cb=None):
-    """Upload a PDF to SQL storage in base64 chunks (several INSERTs in parallel). Returns the file id."""
+    """Store a PDF in the storage file API (the storage cuts it into 18 MB pieces itself).
+    There is NO SQL fallback any more: a PDF stored as SQL rows only fills the database and makes the storage send
+    endless 1 MB blocks to Telegram. A failed upload is reported with its real error instead."""
     init_schema()
     size = os.path.getsize(path)
     j = sql("insert into files(slug, name, size, parts, created, uid) values(?,?,?,0,datetime('now'),?)",
             [slug, name, size, uid])
-    fid = j.get("last_id") or 0
-    if not fid:
-        rows, _ = q("select max(id) as m from files")
-        fid = rows[0]["m"]
-    n = 0
-    total_parts = max(1, -(-size // CHUNK))
+    fid = j.get("last_id") or q("select max(id) as m from files")[0][0]["m"]
+    tid = f"pdf{fid}x{int(time.time())}"
     try:
-        with open(path, "rb") as f, ThreadPoolExecutor(UP_PAR) as ex:
-            while True:
-                futs = []
-                for _ in range(UP_PAR):
-                    batch = []
-                    for _ in range(PER_INSERT):
-                        buf = f.read(CHUNK)
-                        if not buf:
-                            break
-                        batch.append(base64.b64encode(buf).decode())
-                    if not batch:
-                        break
-                    marks = ",".join("(?,?,?)" for _ in batch)
-                    params = []
-                    for k, b in enumerate(batch):
-                        params += [fid, n + k, b]
-                    futs.append(ex.submit(sql, f"insert into chunks(file_id, n, data) values {marks}", params))
-                    n += len(batch)
-                if not futs:
-                    break
-                for fu in futs:
-                    fu.result()
-                if cb:
-                    cb(min(1.0, n / total_parts))
-        sql("update files set parts=? where id=?", [n, fid])  # parts>0 = fully uploaded; only then it shows in Library
-    except Exception:
+        tg_up(tid, path, name, cb)
+        sql("update files set tg=?, parts=1 where id=?", [tid, fid])  # parts>0 = finished; only then it shows in Library
+        return fid
+    except Exception as ex:
+        app.logger.warning("storage upload failed: %s", str(ex)[:300])
+        tg_rm(tid)
         try:
-            sql("delete from chunks where file_id=?", [fid])
             sql("delete from files where id=?", [fid])
         except Exception:
             pass
-        raise
-    return fid
+        raise RuntimeError(f"storage upload failed: {str(ex)[:250]}")
 
 
 def delete_file(fid, owner):
@@ -932,11 +916,13 @@ def build_pdf(paths, out):
 
 # ----------------------------------------------------------------- chapters / queue
 _CH = {}
-CONV_LOCK = threading.Lock()
+CONV_LOCK = threading.Semaphore(int(os.environ.get("CONV_PAR", "3")))
 # Free image service (wsrv.nl) fetches the picture itself and hands back a ready JPEG, so this server does no
 # webp/png decoding at all. Set CONVERT_SERVICE= (empty) to turn it off. Any failure falls back to local convert.
-CONVERT_SERVICE = os.environ.get("CONVERT_SERVICE", "https://wsrv.nl/").strip()
-_WS = {"fail": 0, "off": 0.0}
+CONVERT_SERVICE = os.environ.get("CONVERT_SERVICE", "https://wsrv.nl/,https://images.weserv.nl/").strip()
+CONV_SERVICES = [u.strip() for u in CONVERT_SERVICE.split(",") if u.strip()]   # several mirrors = several requests spread out
+_WS = {u: {"fail": 0, "off": 0.0} for u in CONV_SERVICES}
+_WS_RR = itertools.count()
 
 
 PDF_Q = int(os.environ.get("PDF_Q", "95"))   # JPEG quality when webp/png must be converted
@@ -969,23 +955,32 @@ def prep_image(data, ctype):
 
 
 def fetch_via_service(url):
-    """Returns (jpeg_bytes, 'image/jpeg') from the free converter, or None (caller then does it locally)."""
-    if not CONVERT_SERVICE or time.time() < _WS["off"]:
+    """Returns (jpeg_bytes, 'image/jpeg') from a free converter mirror, or None (caller then does it locally)."""
+    if not CONV_SERVICES:
         return None
     if urlparse(url).path.lower().endswith((".jpg", ".jpeg")):  # already JPEG: no conversion needed, skip the extra hop
         return None
-    try:
-        r = http.get(CONVERT_SERVICE, params={"url": url, "output": "jpg", "q": str(PDF_Q), **({"w": PDF_WIDTH, "we": 1} if PDF_WIDTH else {})}, timeout=40)
-        ok = r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image/jpeg") and len(r.content) > 1500
-    except requests.RequestException:
-        ok = False
-    if not ok:
-        _WS["fail"] += 1
-        if _WS["fail"] >= 5:  # service blocked/down: stop trying for 10 minutes
-            _WS["fail"], _WS["off"] = 0, time.time() + 600
+    now = time.time()
+    live = [u for u in CONV_SERVICES if now >= _WS[u]["off"]]
+    if not live:
         return None
-    _WS["fail"] = 0
-    return r.content, "image/jpeg"
+    start = next(_WS_RR)
+    for k in range(min(2, len(live))):          # try up to 2 different mirrors
+        svc = live[(start + k) % len(live)]
+        try:
+            r = http.get(svc, params={"url": url, "output": "jpg", "q": str(PDF_Q), **({"w": PDF_WIDTH, "we": 1} if PDF_WIDTH else {})}, timeout=20)
+            ok = r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image/jpeg") and len(r.content) > 1500
+        except requests.RequestException:
+            ok = False
+        if ok:
+            _WS[svc]["fail"] = 0
+            return r.content, "image/jpeg"
+        _WS[svc]["fail"] += 1
+        if _WS[svc]["fail"] >= 5:  # this mirror is blocked/down: skip it for 5 minutes
+            _WS[svc]["fail"], _WS[svc]["off"] = 0, time.time() + 300
+    return None
+
+
 ERRLOG = deque(maxlen=40)
 
 
@@ -1245,7 +1240,7 @@ def finish_group(job, tmp, pdf, name, okc):
                     {"name": c["name"], "num": c["num"], "file_id": fid})
             save_state(job["uid"], st)
     except Exception as e:
-        job["errors"].append(f"upload {name}: {str(e)[:150]}")
+        job["errors"].append(f"upload {name}: {str(e)[:300]}")
         job["failed"] += okc
     finally:
         job["uploaded"] += len(okc)
@@ -1328,7 +1323,7 @@ def fetch_chapter_images(job, tmp, ci, c):
             if res:
                 break
             cnt["fail"] += 1
-            time.sleep(1.0 * (k + 1))
+            time.sleep(0.5 * (k + 1))
         if not res:
             raise RuntimeError(f"image {idx} failed")
         data, ext = prep_image(*res)
@@ -1349,7 +1344,7 @@ def fetch_chapter_images(job, tmp, ci, c):
                 f.cancel()
             raise
     if cnt["fail"] >= 3:  # site is pushing back, slow down for the rest of this job
-        job["par"] = max(2, job["par"] - 2)
+        job["par"] = max(6, job["par"] - 2)
     job["t"]["img"] += time.time() - t0
     return paths
 
