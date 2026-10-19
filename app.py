@@ -490,6 +490,11 @@ _schema = {"ok": False}
 _started = {"bg": False}
 JOBS_LOCK = threading.Lock()
 _job_ids = itertools.count(1)
+# Work folder that survives a crash/restart of the app: downloaded images and finished PDFs stay here until uploaded,
+# so a restart continues instead of downloading everything again.
+SPOOL = os.environ.get("SPOOL_DIR") or os.path.join(tempfile.gettempdir(), "hjspool")
+SPOOL_KEEP = int(os.environ.get("SPOOL_KEEP_MIN", "150")) * 60
+os.makedirs(SPOOL, exist_ok=True)
 EXT = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}
 
 sqlhttp = requests.Session()
@@ -629,7 +634,8 @@ class _UploadBody:
     (A generator body made requests send 'Transfer-Encoding: chunked' AS WELL as Content-Length; a proxy in front
     of the storage then reads the raw bytes as chunks and the upload breaks.)"""
 
-    def __init__(self, path, offset, size, cb=None, end=None):
+    def __init__(self, path, offset, size, cb=None, end=None, stop=None):
+        self.stop = stop
         self.f = open(path, "rb")
         self.f.seek(offset)
         self.start, self.size, self.cb = offset, size, cb
@@ -640,6 +646,8 @@ class _UploadBody:
         return self.total
 
     def read(self, n=-1):
+        if self.stop and self.stop():
+            raise Cancelled()
         left = self.total - (self.sent - self.start)
         if left <= 0:
             return b""
@@ -663,6 +671,10 @@ class StorageRefused(Exception):
     pass
 
 
+class Cancelled(StorageRefused):
+    """The user pressed Cancel."""
+
+
 def _short(r):
     """Response text for an error message; an html error page (proxy) is reduced to its title."""
     t = r.text or ""
@@ -672,13 +684,15 @@ def _short(r):
     return t[:200]
 
 
-def tg_up(tid, path, name, cb=None):
+def tg_up(tid, path, name, cb=None, stop=None):
     """Send a PDF to the storage /upload endpoint in pieces (a multiple of the storage chunk each; the proxy in front
     of the storage refuses one huge request with 413). Resumes from where it stopped if the link breaks."""
     size = os.path.getsize(path)
     fails = waits = 0
     pc = UP_PIECE_CHUNKS
     while True:
+        if stop and stop():
+            raise Cancelled()
         body = None
         try:
             r = sqlhttp.get(f"{STORE_BASE}/status/{tid}", timeout=30)
@@ -693,7 +707,7 @@ def tg_up(tid, path, name, cb=None):
                 continue
             have = int(st.get("stored", 0)) if r.status_code == 200 else 0
             end = min(have + pc * STORE_CHUNK, size)
-            body = _UploadBody(path, have, size, cb, end) if end > have else b""
+            body = _UploadBody(path, have, size, cb, end, stop) if end > have else b""
             u = f"{STORE_BASE}/upload?" + urlencode({"id": tid, "name": name, "offset": have, "size": size})
             r = requests.post(u, data=body, headers={"Content-Type": "application/octet-stream"}, timeout=(15, 900))
             if r.status_code == 200:
@@ -719,6 +733,8 @@ def tg_up(tid, path, name, cb=None):
         except StorageRefused:
             raise
         except Exception as ex:
+            if stop and stop():
+                raise Cancelled()
             fails += 1
             app.logger.warning("upload try %d failed: %s", fails, str(ex)[:200])
             if fails >= 10:
@@ -738,27 +754,43 @@ def tg_rm(tid):
         app.logger.warning("could not delete stored file %s", tid, exc_info=True)
 
 
-def store_pdf(path, name, slug, uid, cb=None):
+def store_pdf(path, name, slug, uid, cb=None, stop=None, ids=None, on_ids=None):
     """Store a PDF in the storage file API (the storage cuts it into 18 MB pieces itself).
     There is NO SQL fallback any more: a PDF stored as SQL rows only fills the database and makes the storage send
-    endless 1 MB blocks to Telegram. A failed upload is reported with its real error instead."""
+    endless 1 MB blocks to Telegram. A failed upload is reported with its real error instead.
+    ids = {"fid":..,"tid":..} of an earlier, interrupted try: the upload then continues where it stopped.
+    On a failure the row and the pieces already stored are KEPT (the next try resumes); only Cancel removes them."""
     init_schema()
     size = os.path.getsize(path)
-    j = sql("insert into files(slug, name, size, parts, created, uid) values(?,?,?,0,datetime('now'),?)",
-            [slug, name, size, uid])
-    fid = j.get("last_id") or q("select max(id) as m from files")[0][0]["m"]
-    tid = f"pdf{fid}x{int(time.time())}"
+    ids = ids if ids is not None else {}
+    fid, tid = ids.get("fid"), ids.get("tid")
+    if fid:
+        try:
+            if not q("select 1 as x from files where id=?", [fid])[0]:
+                fid = tid = None
+        except Exception:
+            pass
+    if not fid:
+        j = sql("insert into files(slug, name, size, parts, created, uid) values(?,?,?,0,datetime('now'),?)",
+                [slug, name, size, uid])
+        fid = j.get("last_id") or q("select max(id) as m from files")[0][0]["m"]
+        tid = f"pdf{fid}x{int(time.time())}"
+        ids.update(fid=fid, tid=tid)
+        if on_ids:
+            on_ids(fid, tid)
     try:
-        tg_up(tid, path, name, cb)
+        tg_up(tid, path, name, cb, stop)
         sql("update files set tg=?, parts=1 where id=?", [tid, fid])  # parts>0 = finished; only then it shows in Library
         return fid
-    except Exception as ex:
-        app.logger.warning("storage upload failed: %s", str(ex)[:300])
+    except Cancelled:
         tg_rm(tid)
         try:
             sql("delete from files where id=?", [fid])
         except Exception:
             pass
+        raise
+    except Exception as ex:
+        app.logger.warning("storage upload failed: %s", str(ex)[:300])
         raise RuntimeError(f"storage upload failed: {str(ex)[:250]}")
 
 
@@ -1145,7 +1177,7 @@ def save_jobs():
         with JOBS_LOCK:
             act = [{"uid": j["uid"], "who": j["who"], "slug": j["slug"], "title": j["title"],
                     "chapters": j["chapters"], "per": j["per"]}
-                   for j in JOBS if j["status"] in ("queued", "running")]
+                   for j in JOBS if j["status"] in ("queued", "running") and not j["cancel"]]
             sql("insert or replace into kv(k, v) values('jobs', ?)", [json.dumps(act, ensure_ascii=False)])
     except Exception:
         app.logger.warning("could not save jobs", exc_info=True)
@@ -1210,16 +1242,33 @@ def expire_old():
     return len(rows)
 
 
+def clean_spool():
+    """Remove work folders nobody continued for SPOOL_KEEP_MIN minutes (the storage drops half-uploaded files after 3 h)."""
+    now = time.time()
+    for d in os.listdir(SPOOL):
+        full = os.path.join(SPOOL, d)
+        try:
+            newest = max([os.path.getmtime(full)] + [os.path.getmtime(os.path.join(full, x)) for x in os.listdir(full)])
+            if now - newest > SPOOL_KEEP:
+                shutil.rmtree(full, ignore_errors=True)
+        except OSError:
+            pass
+
+
 def housekeep_loop():
     time.sleep(90)
+    rounds = 0
     while True:
         try:
-            n = expire_old()
-            if n:
-                app.logger.info("housekeeping removed %d old files", n)
+            clean_spool()
+            if rounds % 12 == 0:
+                n = expire_old()
+                if n:
+                    app.logger.info("housekeeping removed %d old files", n)
         except Exception:
             app.logger.warning("housekeeping error", exc_info=True)
-        time.sleep(6 * 3600)
+        rounds += 1
+        time.sleep(1800)
 
 
 def ensure_workers():
@@ -1233,6 +1282,9 @@ def ensure_workers():
 def worker():
     while True:
         job = JOBQ.get()
+        if job["cancel"]:  # cancelled while waiting in the queue
+            job["status"], job["msg"] = "cancelled", ""
+            continue
         job["status"] = "running"
         t0 = time.time()
         try:
@@ -1249,18 +1301,59 @@ def worker():
         save_jobs()
 
 
+def _meta_path(tmp):
+    return os.path.join(tmp, "meta.json")
+
+
+def _meta_read(tmp):
+    try:
+        with open(_meta_path(tmp), encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _meta_write(tmp, **kw):
+    m = _meta_read(tmp) or {}
+    m.update(kw)
+    part = _meta_path(tmp) + ".part"
+    with open(part, "w", encoding="utf-8") as fh:
+        json.dump(m, fh, ensure_ascii=False)
+    os.replace(part, _meta_path(tmp))
+
+
+def group_dir(job, group):
+    """Same chapters = same folder, so a restarted/retried job finds the images and the PDF it already made."""
+    key = hashlib.sha1((f'{job["uid"]}|{job["slug"]}|' + ",".join(c["chapter_id"] for c in group)).encode()).hexdigest()[:20]
+    d = os.path.join(SPOOL, key)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def finish_group(job, tmp, pdf, name, okc):
-    """Upload the PDF and update the library state. Runs in the background while the next group downloads."""
+    """Upload the PDF and update the library state. Runs in the background while the next group downloads.
+    If the upload fails the PDF stays in its folder: a retry or a restart only uploads it again (resuming)."""
     t0 = time.time()
     job["up_n"], job["up_cur"] = len(okc), 0.0
+    keep = False
+    ids = dict((_meta_read(tmp) or {}).get("ids") or {})
+
+    def on_ids(fid, tid):
+        try:
+            _meta_write(tmp, ids={"fid": fid, "tid": tid})
+        except OSError:
+            pass
+
     try:
+        if job["cancel"]:
+            raise Cancelled()
         job["up_msg"] = f"Uploading {name} 0%"
 
         def prog(f):
             job["up_cur"] = f
             job["up_msg"] = f"Uploading {name} {int(f * 100)}%"
 
-        fid = store_pdf(pdf, name, job["slug"], job["uid"], cb=prog)
+        fid = store_pdf(pdf, name, job["slug"], job["uid"], cb=prog, stop=lambda: job["cancel"], ids=ids, on_ids=on_ids)
         with LOCK:
             st = load_state(job["uid"])
             rec = st.setdefault(job["slug"], {"chapters": {}})
@@ -1269,14 +1362,18 @@ def finish_group(job, tmp, pdf, name, okc):
                 rec["chapters"].setdefault(c["chapter_id"], {}).update(
                     {"name": c["name"], "num": c["num"], "file_id": fid})
             save_state(job["uid"], st)
+    except Cancelled:
+        pass
     except Exception as e:
         job["errors"].append(f"upload {name}: {str(e)[:300]}")
         job["failed"] += okc
+        keep = True
     finally:
         job["uploaded"] += len(okc)
         job["up_cur"], job["up_n"], job["up_msg"] = 0.0, 0, ""
         job["t"]["up"] += time.time() - t0
-        shutil.rmtree(tmp, ignore_errors=True)
+        if not keep:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def run_job(job):
@@ -1288,37 +1385,56 @@ def run_job(job):
             if job["cancel"]:
                 break
             group = chs[g:g + per]
-            tmp = tempfile.mkdtemp(prefix="hj_")
+            tmp = group_dir(job, group)
             handed = False
+            files = []
             try:
-                files, okc = [], []
-                for ci, c in enumerate(group):
-                    try:
-                        files += fetch_chapter_images(job, tmp, ci, c)
-                        okc.append(c)
-                    except Exception as e:  # skip this chapter, keep going
-                        if not job["cancel"]:
-                            job["errors"].append(f'{c["name"]}: {str(e)[:120]}')
-                            job["failed"].append(c)
+                pdf = os.path.join(tmp, "out.pdf")
+                meta = _meta_read(tmp)
+                if meta and meta.get("name") and meta.get("okc") and os.path.isfile(pdf):
+                    # an earlier run already built this PDF (crash / failed upload): only upload it, nothing is downloaded again
+                    name, okc = meta["name"], meta["okc"]
+                    have = {c["chapter_id"] for c in okc}
+                    job["failed"] += [c for c in group if c["chapter_id"] not in have]
+                    job["done"] += len(group)
+                    job["msg"] = f"Continuing upload: {name}"
+                else:
+                    okc = []
+                    for ci, c in enumerate(group):
+                        try:
+                            files += fetch_chapter_images(job, tmp, ci, c)
+                            okc.append(c)
+                        except Exception as e:  # skip this chapter, keep going
+                            if not job["cancel"]:
+                                job["errors"].append(f'{c["name"]}: {str(e)[:120]}')
+                                job["failed"].append(c)
+                        if job["cancel"]:
+                            break
+                        job["done"] += 1
+                        job["cur_n"] = job["cur_ok"] = 0
                     if job["cancel"]:
                         break
-                    job["done"] += 1
-                    job["cur_n"] = job["cur_ok"] = 0
-                if not files:
-                    continue
-                first, last = chap_label(okc[0]), chap_label(okc[-1])
-                name = f'{safe(job["title"])} - Chapter {first}.pdf' if len(okc) == 1 else \
-                       f'{safe(job["title"])} - Ch {first}-{last}.pdf'
-                pdf = os.path.join(tmp, "out.pdf")
-                job["msg"] = f"Building PDF: {name}"
-                t0 = time.time()
-                build_pdf(files, pdf)
-                job["t"]["pdf"] += time.time() - t0
-                for p in files:  # images are inside the PDF now, free the disk
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
+                    if not files:
+                        shutil.rmtree(tmp, ignore_errors=True)
+                        handed = True  # nothing to keep
+                        continue
+                    first, last = chap_label(okc[0]), chap_label(okc[-1])
+                    name = f'{safe(job["title"])} - Chapter {first}.pdf' if len(okc) == 1 else \
+                           f'{safe(job["title"])} - Ch {first}-{last}.pdf'
+                    job["msg"] = f"Building PDF: {name}"
+                    t0 = time.time()
+                    part = pdf + ".part"
+                    build_pdf(files, part)
+                    os.replace(part, pdf)
+                    _meta_write(tmp, name=name, okc=okc, slug=job["slug"], uid=job["uid"])
+                    job["t"]["pdf"] += time.time() - t0
+                    for p in files:  # images are inside the PDF now, free the disk
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+                if job["cancel"]:
+                    break
                 pend.append(up.submit(finish_group, job, tmp, pdf, name, okc))
                 handed = True
                 while len(pend) > 1:  # at most one upload waiting, so disk/memory stay small
@@ -1327,15 +1443,29 @@ def run_job(job):
                 job["errors"].append(f"PDF group {g // per + 1}: {str(e)[:150]}")
                 job["failed"] += group
             finally:
-                if not handed:
-                    shutil.rmtree(tmp, ignore_errors=True)
+                if not handed and job["cancel"]:
+                    shutil.rmtree(tmp, ignore_errors=True)  # on an error the folder stays: a retry reuses the images
         for f in pend:
             f.result()
     finally:
         up.shutdown(wait=True)
+        if job["cancel"]:  # a cancelled job leaves nothing behind
+            for g in range(0, len(chs), per):
+                shutil.rmtree(os.path.join(SPOOL, hashlib.sha1((f'{job["uid"]}|{job["slug"]}|' + ",".join(c["chapter_id"] for c in chs[g:g + per])).encode()).hexdigest()[:20]), ignore_errors=True)
 
 
 def fetch_chapter_images(job, tmp, ci, c):
+    mk = os.path.join(tmp, f"c{ci:03d}.json")
+    try:  # this chapter was fully downloaded before a restart: use the files that are still on disk
+        with open(mk, encoding="utf-8") as fh:
+            names = json.load(fh)
+        old = [os.path.join(tmp, x) for x in names]
+        if old and all(os.path.isfile(x) for x in old):
+            job["cur_n"] = job["cur_ok"] = len(old)
+            job["msg"] = f'{c["name"]}  (already downloaded)'
+            return old
+    except Exception:
+        pass
     panels = parse_panels(c["chapter_id"], fetch_html(f"/{c['chapter_id']}/"))["panels"]
     if not panels:
         raise RuntimeError("no images found")
@@ -1376,6 +1506,12 @@ def fetch_chapter_images(job, tmp, ci, c):
     if cnt["fail"] >= 3:  # site is pushing back, slow down for the rest of this job
         job["par"] = max(6, job["par"] - 2)
     job["t"]["img"] += time.time() - t0
+    try:
+        with open(mk + ".part", "w", encoding="utf-8") as fh:
+            json.dump([os.path.basename(x) for x in paths], fh)
+        os.replace(mk + ".part", mk)
+    except OSError:
+        pass
     return paths
 
 
@@ -2390,9 +2526,12 @@ def api_update():
 def api_cancel(jid):
     j = find_job(jid)
     if j and j["status"] in ("queued", "running"):
-        j["cancel"] = True
-        j["msg"] = "Cancelling…"
-    return jsonify({"ok": True})
+        j["cancel"] = True          # the worker sees this in every loop (images, PDF, upload) and stops
+        j["status"] = "cancelled"   # show it at once and free the user's job slot
+        j["msg"] = j["up_msg"] = ""
+        threading.Thread(target=save_jobs, daemon=True).start()   # a cancelled job must not come back after a restart
+        return jsonify({"ok": True, "msg": "Cancelled"})
+    return jsonify({"ok": True, "msg": "Already finished"})
 
 
 @app.post("/api/retry/<int:jid>")
